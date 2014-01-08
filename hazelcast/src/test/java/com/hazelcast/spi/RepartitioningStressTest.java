@@ -16,22 +16,21 @@
 
 package com.hazelcast.spi;
 
+import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.core.IMap;
+import com.hazelcast.instance.GroupProperties;
 import com.hazelcast.test.HazelcastSerialClassRunner;
 import com.hazelcast.test.HazelcastTestSupport;
 import com.hazelcast.test.TestHazelcastInstanceFactory;
 import com.hazelcast.test.annotation.SlowTest;
-import org.junit.AfterClass;
+import org.junit.After;
 import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 import org.junit.runner.RunWith;
 
-import java.io.IOException;
-import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -41,6 +40,11 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.fail;
 
+/**
+ * Tests how well hazelcast is able to deal with a cluster where members are leaving and joining all the time.
+ * So when partitions are moving around, is Hazelcast able to do readonly operations, and is it able to do update
+ * operations with backups? That is what this test is all about.
+ */
 @RunWith(HazelcastSerialClassRunner.class)
 @Category(SlowTest.class)
 public class RepartitioningStressTest extends HazelcastTestSupport {
@@ -49,69 +53,70 @@ public class RepartitioningStressTest extends HazelcastTestSupport {
     private HazelcastInstance hz;
     private TestHazelcastInstanceFactory instanceFactory;
 
-    private final static long DURATION_SECONDS = 120;
-    private final static int THREAD_COUNT = 10;
+    private final static long DURATION_SECONDS = 300;
+    private final static int THREAD_COUNT = 16;
 
-    @BeforeClass
-    @AfterClass
-    public static void killAllHazelcastInstances() throws IOException {
+    @After
+    public void killAllHazelcastInstances() {
         Hazelcast.shutdownAll();
     }
 
     @Before
     public void setUp() {
+        killAllHazelcastInstances();
         instanceFactory = this.createHazelcastInstanceFactory(100000);
-        hz = instanceFactory.newHazelcastInstance();
+        Config config = new Config();
+        config.setProperty(GroupProperties.PROP_HEALTH_MONITORING_LEVEL, "OFF");
+        hz = instanceFactory.newHazelcastInstance(config);
 
         for (int k = 0; k < 5; k++) {
-            queue.add(instanceFactory.newHazelcastInstance());
+            queue.add(instanceFactory.newHazelcastInstance(config));
         }
     }
 
     @Test
     public void callWithBackups() throws InterruptedException {
-        final Map<Integer, Integer> map = hz.getMap("map");
+        final IMap<Integer, Integer> map = hz.getMap("map");
         final int itemCount = 10000;
         for (int k = 0; k < itemCount; k++) {
-            map.put(k, k);
+            map.put(k, 0);
         }
 
         RestartThread restartThread = new RestartThread();
         restartThread.start();
 
-        TestThread[] testThreads = new TestThread[THREAD_COUNT];
+        UpdateThread[] testThreads = new UpdateThread[THREAD_COUNT];
         for (int l = 0; l < testThreads.length; l++) {
-            testThreads[l] = new TestThread("Thread-" + l) {
-                @Override
-                void doRun() {
-                    long endTime = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(DURATION_SECONDS);
-
-                    Random random = new Random();
-                    for (; ; ) {
-                        int key = random.nextInt(itemCount);
-                        assertEquals(new Integer(key), map.put(key, key));
-                        if (System.currentTimeMillis() > endTime) {
-                            break;
-                        }
-                    }
-                }
-            };
+            testThreads[l] = new UpdateThread(l, itemCount, map);
             testThreads[l].start();
         }
 
         Thread.sleep(TimeUnit.SECONDS.toMillis(DURATION_SECONDS));
-
+        restartThread.stop = true;
         for (TestThread t : testThreads) {
             t.join(TimeUnit.MINUTES.toMillis(1));
             t.assertDiedPeacefully();
         }
 
-        restartThread.stop = true;
+        //now we are going to verify that the values in the map have incremented the expected amount
+        //and that no backups have gone lost.
+        int[] expectedCounts = new int[itemCount];
+        for (UpdateThread updateThread : testThreads) {
+            for (int k = 0; k < expectedCounts.length; k++) {
+                expectedCounts[k] += updateThread.updates[k];
+            }
+        }
+
+        for (int k = 0; k < expectedCounts.length; k++) {
+            int expected = expectedCounts[k];
+            int actual = map.get(k);
+            assertEquals("value is different for key:"+k,expected, actual);
+        }
     }
 
     @Test
     public void callWithoutBackups() throws InterruptedException {
-        final Map<Integer, Integer> map = hz.getMap("map");
+        final IMap<Integer, Integer> map = hz.getMap("map");
         final int itemCount = 10000;
         for (int k = 0; k < itemCount; k++) {
             map.put(k, k);
@@ -171,13 +176,12 @@ public class RepartitioningStressTest extends HazelcastTestSupport {
         public void assertDiedPeacefully() {
             assertFalse(isAlive());
 
-            if(t!=null){
+            if (t != null) {
                 t.printStackTrace();
-                fail(getName()+" failed with an exception:"+t.getMessage());
+                fail(getName() + " failed with an exception:" + t.getMessage());
             }
         }
     }
-
 
     public class RestartThread extends Thread {
 
@@ -191,6 +195,38 @@ public class RepartitioningStressTest extends HazelcastTestSupport {
                     hz.shutdown();
                     queue.add(instanceFactory.newHazelcastInstance());
                 } catch (InterruptedException e) {
+                }
+            }
+        }
+    }
+
+    private class UpdateThread extends TestThread {
+        private final int itemCount;
+        private final IMap<Integer, Integer> map;
+        private final int[] updates;
+
+        public UpdateThread(int l, int itemCount, IMap<Integer, Integer> map) {
+            super("Thread-" + l);
+            this.itemCount = itemCount;
+            this.map = map;
+            this.updates = new int[itemCount];
+        }
+
+        @Override
+        void doRun() {
+            long endTime = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(DURATION_SECONDS);
+
+            Random random = new Random();
+            for (; ; ) {
+                int key = random.nextInt(itemCount);
+                int oldValue = map.get(key);
+                int newValue = oldValue++;
+                if (map.replace(key, oldValue, newValue)) {
+                    updates[key]++;
+                }
+
+                if (System.currentTimeMillis() > endTime) {
+                    break;
                 }
             }
         }
